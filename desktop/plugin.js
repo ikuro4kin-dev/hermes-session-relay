@@ -1,0 +1,379 @@
+/**
+ * Session Relay — a Hermes Desktop plugin.
+ *
+ * What it does (automatic hand-off to a new session when the context fills up):
+ *  1. Watches how full the focused session's context window is.
+ *  2. When usage crosses the threshold and the turn has finished, it submits a
+ *     hidden service message to the session: the agent writes a hand-off note
+ *     and calls start_chat. The new chat is named after the current one with the
+ *     number incremented ("Bugfix-6" → "Bugfix-7").
+ *  3. Shows toasts ("preparing the relay…" → "Relay ready: X-7") plus an OS
+ *     notification when the window is in the background; clicking it opens the
+ *     new chat.
+ *
+ * The ⚡ chip in the status bar starts a relay manually (works below the
+ * threshold too). Settings live under Settings → Plugins → Session Relay.
+ *
+ * The default threshold is 45% — below the point (~50%) where Hermes compacts
+ * the history itself, so the relay fires before compaction. Change it in the
+ * plugin settings or in DEFAULTS below.
+ */
+
+import { atom, Button, cn, haptic, host, ListRow, SegmentedControl, Tip, ToggleRow, useValue } from '@hermes/plugin-sdk'
+import { jsx, jsxs } from 'react/jsx-runtime'
+import { useEffect } from 'react'
+
+const ID = 'session-relay'
+const TITLE_LIMIT = 40
+const DEFAULTS = { auto: true, threshold: 45 }
+
+/** "Bugfix-6" → "Bugfix-7"; a title without a number gets "-2". */
+function nextTitle(raw) {
+  const t = String(raw || '').trim()
+  if (!t) {
+    return ''
+  }
+  const m = t.match(/^(.*?)(\d+)(\D*)$/)
+  let out
+  if (!m) {
+    out = t + '-2'
+  } else {
+    const n = String(parseInt(m[2], 10) + 1)
+    const num = m[2].length > 1 && m[2].startsWith('0') ? n.padStart(m[2].length, '0') : n
+    out = m[1] + num + m[3]
+  }
+  return out.length > TITLE_LIMIT ? out.slice(0, TITLE_LIMIT) : out
+}
+
+export default {
+  id: ID,
+  name: 'Session Relay',
+
+  register(ctx) {
+    const storedPrefs = { ...ctx.storage.get('prefs', {}) }
+    const prefs = atom({ ...DEFAULTS, ...storedPrefs })
+    const $relay = atom({ phase: 'idle', title: '' })
+    const pendingIds = new Set()
+    let inFlight = false
+    let lastProbeAt = 0
+    let lastFailAt = 0
+
+    console.log('[session-relay] loaded; threshold=' + prefs.get().threshold)
+
+    const update = patch => {
+      prefs.set({ ...prefs.get(), ...patch })
+      ctx.storage.set('prefs', prefs.get())
+    }
+
+    const readRelayed = () => ctx.storage.get('relayed', {}) || {}
+
+    const markRelayed = id => {
+      const map = { ...readRelayed() }
+      const cutoff = Date.now() - 30 * 864e5
+      for (const k of Object.keys(map)) {
+        if (!map[k] || map[k] < cutoff) {
+          delete map[k]
+        }
+      }
+      map[id] = Date.now()
+      ctx.storage.set('relayed', map)
+    }
+
+    const isBusy = runtimeId => {
+      const atomRef = host.state.busyBySession
+      const m = (atomRef && atomRef.get && atomRef.get()) || {}
+      return m[runtimeId] === true
+    }
+
+    async function precisePercent(runtimeId) {
+      lastProbeAt = Date.now()
+      try {
+        const res = await host.request('session.context_breakdown', { session_id: runtimeId })
+        if (res && typeof res.context_percent === 'number') {
+          return res.context_percent
+        }
+      } catch (e) {
+        console.log('[session-relay] breakdown failed, falling back to stream value', e)
+      }
+      const u = host.state.focusedUsage.get()
+      return u && typeof u.context_percent === 'number' ? u.context_percent : null
+    }
+
+    function watchForSession(storedId, newTitle) {
+      // ~2 minute window: 24 ticks × 5 s after an initial 4 s pause.
+      let left = 24
+      const t0 = Date.now() / 1000
+      const tick = async () => {
+        try {
+          const res = await host.request('session.list', { limit: 15 })
+          const rows = (res && res.sessions) || []
+          // Confirm by the APPEARANCE of a new session, not by its title: the
+          // gateway writes the new chat's title only after its first turn
+          // ends (minutes), so a title check used to time out and report a
+          // false "not confirmed".
+          const hit = rows.find(
+            r => r && r.id !== storedId && r.source === 'desktop' && (!r.started_at || r.started_at >= t0 - 120)
+          )
+          if (hit) {
+            $relay.set({ phase: 'done', title: newTitle })
+            host.notify({ kind: 'success', message: 'Session relay ready: "' + newTitle + '"' })
+            try {
+              ctx.os.notify({ title: 'Session relay ready', body: newTitle, activate: '/' + encodeURIComponent(hit.id) })
+            } catch (e) {
+              console.log('[session-relay] os.notify failed', e)
+            }
+            return
+          }
+        } catch (e) {
+          console.log('[session-relay] watch failed', e)
+        }
+        if (--left > 0) {
+          ctx.setTimeout(tick, 5000)
+        } else {
+          $relay.set({ phase: 'idle', title: '' })
+          host.notify({ kind: 'warning', message: 'Session relay: the new chat was not confirmed. Check the chat list or press ⚡ to retry.' })
+        }
+      }
+      ctx.setTimeout(tick, 4000)
+    }
+
+    async function relayNow(opts) {
+      // The lock is taken synchronously, before the first await: parallel
+      // triggers (message.complete + a chip re-render) would otherwise pass the
+      // check and submit the service message several times (duplicates).
+      if (inFlight) {
+        return
+      }
+      inFlight = true
+      try {
+        await relayRun(opts)
+      } finally {
+        inFlight = false
+      }
+    }
+
+    async function relayRun(opts) {
+      const manual = Boolean(opts && opts.manual)
+      const runtimeId = host.state.focusedSessionId.get()
+      const storedId = host.state.focusedStoredSessionId.get()
+      if (!runtimeId || !storedId) {
+        if (manual) {
+          host.notify({ kind: 'warning', message: 'Session relay: no active session.' })
+        }
+        return
+      }
+      if (isBusy(runtimeId)) {
+        if (manual) {
+          host.notify({ kind: 'warning', message: 'Session relay: the session is busy — retry after the reply.' })
+        }
+        return
+      }
+      const p = prefs.get()
+      if (!manual) {
+        if (!p.auto) {
+          return
+        }
+        if (readRelayed()[storedId]) {
+          return
+        }
+        if (pendingIds.has(storedId)) {
+          return
+        }
+        if (Date.now() - lastFailAt < 300000) {
+          return
+        }
+        const u = host.state.focusedUsage.get()
+        const cheap = u && typeof u.context_percent === 'number' ? u.context_percent : null
+        if (cheap == null) {
+          if (Date.now() - lastProbeAt < 60000) {
+            return
+          }
+        } else if (cheap < p.threshold - 3) {
+          return
+        }
+      }
+
+      const pct = await precisePercent(runtimeId)
+      if (!manual) {
+        if (pct == null || pct < p.threshold) {
+          return
+        }
+        if (readRelayed()[storedId]) {
+          return
+        }
+      }
+      if (isBusy(runtimeId)) {
+        return
+      }
+
+      pendingIds.add(storedId)
+      $relay.set({ phase: 'working', title: '' })
+      try {
+        let oldTitle = ''
+        try {
+          const res = await host.request('session.title', { session_id: runtimeId })
+          oldTitle = String((res && res.title) || '').trim()
+        } catch (e) {
+          console.log('[session-relay] title read failed', e)
+        }
+
+        const newTitle = nextTitle(oldTitle)
+        const titleLine = newTitle
+          ? '— title: "' + newTitle + '".'
+          : '— title: choose one yourself that fits the task.'
+        const msg = [
+          '[Session Relay plugin — service message]',
+          'Context usage in this session: ' + (pct == null ? '—' : pct + '%') + '.',
+          'Prepare a hand-off note so the work can continue in a new session, then call start_chat:',
+          '— message: the full hand-off text (current task, state, what has been done, the next step, important details from this conversation);',
+          titleLine,
+          'Do it right away, without clarifying questions; reply in this chat with one short line.'
+        ].join('\n')
+
+        await host.request('prompt.submit', { session_id: runtimeId, text: msg, display_kind: 'hidden' })
+        markRelayed(storedId)
+        console.log('[session-relay] relay started; new title=' + (newTitle || '(auto)'))
+        $relay.set({ phase: 'started', title: newTitle })
+        host.notify({
+          kind: 'info',
+          message: newTitle ? 'Session relay: preparing "' + newTitle + '"…' : 'Session relay: preparing a new chat…'
+        })
+        if (newTitle) {
+          watchForSession(storedId, newTitle)
+        }
+      } catch (e) {
+        lastFailAt = Date.now()
+        $relay.set({ phase: 'idle', title: '' })
+        host.notifyError(e, 'Session relay: could not start.')
+      } finally {
+        pendingIds.delete(storedId)
+      }
+    }
+
+    function SettingsPage() {
+      const p = useValue(prefs)
+      const u = useValue(host.state.focusedUsage)
+      const storedId = useValue(host.state.focusedStoredSessionId)
+      const pct = u && typeof u.context_percent === 'number' ? u.context_percent : null
+      const marked = storedId ? Boolean(readRelayed()[storedId]) : false
+
+      return jsxs('div', {
+        children: [
+          jsx(ToggleRow, {
+            checked: p.auto,
+            label: 'Automatic relay',
+            description:
+              'When the session context reaches the threshold, the agent writes a hand-off note and opens a new chat with the title number incremented (+1).',
+            onChange: on => update({ auto: on })
+          }),
+          jsx(ListRow, {
+            title: 'Trigger threshold',
+            description:
+              'Hermes compacts the history at about 50%; the threshold is kept below that so the relay fires before compaction.',
+            action: jsx(SegmentedControl, {
+              value: String(p.threshold),
+              onChange: v => update({ threshold: Number(v) }),
+              options: [
+                { id: '30', label: '30%' },
+                { id: '40', label: '40%' },
+                { id: '45', label: '45%' },
+                { id: '50', label: '50%' }
+              ]
+            })
+          }),
+          jsx(ListRow, {
+            title: 'Current state',
+            description: pct == null ? 'The active session context has not been measured yet.' : 'Active session context: ' + pct + '%.',
+            action: jsx('span', {
+              className: 'text-[length:var(--conversation-caption-font-size)] text-(--ui-text-secondary)',
+              children: marked ? 'relay already started' : 'relay not started yet'
+            })
+          }),
+          jsx(ListRow, {
+            title: 'Reset marks',
+            description: 'Useful to retest the relay on the same session.',
+            action: jsx(Button, {
+              variant: 'secondary',
+              size: 'sm',
+              onClick: () => {
+                ctx.storage.remove('relayed')
+                host.notify({ kind: 'info', message: 'Session relay: marks cleared.' })
+              },
+              children: 'Reset'
+            })
+          })
+        ]
+      })
+    }
+
+    function Chip() {
+      const p = useValue(prefs)
+      const u = useValue(host.state.focusedUsage)
+      const relay = useValue($relay)
+      const runtimeId = useValue(host.state.focusedSessionId)
+      const storedId = useValue(host.state.focusedStoredSessionId)
+      const busyMap = useValue(host.state.busyBySession)
+
+      const pct = u && typeof u.context_percent === 'number' ? u.context_percent : null
+      const busyNow = Boolean(runtimeId && busyMap && busyMap[runtimeId] === true)
+
+      useEffect(() => {
+        void relayNow({ manual: false })
+      }, [pct, runtimeId, storedId, p && p.auto, p && p.threshold, busyNow])
+
+      const working = relay.phase === 'working' || relay.phase === 'started'
+      const near = pct != null && p && pct >= p.threshold
+      const label = working ? '…' : pct == null ? '—' : pct + '%'
+      const tip = working
+        ? 'Session relay: preparing "' + (relay.title || 'a new chat') + '"…'
+        : relay.phase === 'done'
+          ? 'Session relay already created: "' + relay.title + '".'
+          : pct == null
+            ? 'Session relay: context not measured yet. Click to start a relay manually.'
+            : 'Session relay — context ' + pct + '%. Auto threshold ' + (p ? p.threshold : '?') + '%. Click to start manually.'
+
+      return jsx(Tip, {
+        label: tip,
+        children: jsxs('button', {
+          type: 'button',
+          className: cn(
+            'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] transition-colors',
+            near ? 'text-(--ui-accent)' : 'text-(--ui-text-tertiary)',
+            'hover:bg-(--chrome-action-hover) hover:text-foreground'
+          ),
+          onClick: () => {
+            haptic('tap')
+            void relayNow({ manual: true })
+          },
+          children: [
+            jsx('span', { 'aria-hidden': true, children: '⚡' }),
+            jsx('span', { children: label })
+          ]
+        })
+      })
+    }
+
+    // Additional trigger: check the threshold after any turn completes.
+    ctx.onEvent('message.complete', () => {
+      ctx.setTimeout(() => {
+        void relayNow({ manual: false })
+      }, 2500)
+    })
+
+    if (ctx.registerSettingsPage) {
+      ctx.registerSettingsPage({
+        id: 'main',
+        title: 'Session Relay',
+        icon: 'sync',
+        render: SettingsPage
+      })
+    }
+
+    ctx.register({
+      id: 'chip',
+      area: 'statusBar.right',
+      order: 145,
+      render: () => jsx(Chip, {})
+    })
+  }
+}

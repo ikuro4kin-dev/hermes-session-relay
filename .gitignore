@@ -1,0 +1,15 @@
+node_modules/
+*.log
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# gateway runtime state
+pending.json
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
