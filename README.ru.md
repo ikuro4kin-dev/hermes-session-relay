@@ -45,7 +45,7 @@ session-relay/
 **Из Git (рекомендуется):**
 
 ```bash
-hermes plugins install https://github.com/<owner>/hermes-session-relay
+hermes plugins install https://github.com/ikuro4kin-dev/hermes-session-relay
 ```
 
 Пакет попадёт в `$HERMES_HOME/plugins/session-relay/`. Дальше:
