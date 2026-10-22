@@ -1,5 +1,7 @@
 # Session Relay — a Hermes Agent plugin
 
+![Session Relay: hand off a long-running chat to a fresh session](assets/banner.png)
+
 **Hand your long-running chat over to a fresh session before the context window fills up.**
 
 Hermes compacts a conversation when its context reaches ~50% of the model window. Compaction keeps a summary and drops details; after two or three compactions a long working session turns into a soup of half-remembered facts and duplicated messages. Session Relay solves the same problem the other way round: as the context approaches the threshold, the agent writes a hand-off note and opens a **new chat** that starts with that note — while the old chat stays untouched and readable.
