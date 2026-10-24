@@ -4,12 +4,17 @@
  * What it does (automatic hand-off to a new session when the context fills up):
  *  1. Watches how full the focused session's context window is.
  *  2. When usage crosses the threshold and the turn has finished, it submits a
- *     hidden service message to the session: the agent writes a hand-off note
- *     and calls start_chat. The new chat is named after the current one with the
- *     number incremented ("Bugfix-6" → "Bugfix-7").
- *  3. Shows toasts ("preparing the relay…" → "Relay ready: X-7") plus an OS
- *     notification when the window is in the background; clicking it opens the
- *     new chat.
+ *     hidden service message: the agent replies with the hand-off note itself.
+ *  3. The plugin opens the new chat through the SDK — host.newChat() — and
+ *     submits the note into it (host.composer.submit('new', note)), so the
+ *     fresh session starts with the hand-off as its first user message. The new
+ *     chat is named after the current one with the number incremented
+ *     ("Bugfix-6" → "Bugfix-7").
+ *  4. A toast and an OS notification announce the new chat; clicking the
+ *     notification opens it.
+ *
+ * No agent tool is involved: the plugin reads the agent's reply from the
+ * message.complete event and types the note into the new chat itself.
  *
  * The ⚡ chip in the status bar starts a relay manually (works below the
  * threshold too). Settings live under Settings → Plugins → Session Relay.
@@ -26,6 +31,9 @@ import { useEffect } from 'react'
 const ID = 'session-relay'
 const TITLE_LIMIT = 40
 const DEFAULTS = { auto: true, threshold: 45 }
+const NOTE_TIMEOUT_MS = 300000
+const SEED_TRIES = 40
+const SEED_RETRY_MS = 500
 
 /** "Bugfix-6" → "Bugfix-7"; a title without a number gets "-2". */
 function nextTitle(raw) {
@@ -57,6 +65,9 @@ export default {
     let inFlight = false
     let lastProbeAt = 0
     let lastFailAt = 0
+    // The relay whose hand-off note has not arrived yet:
+    // { runtimeId, storedId, newTitle }.
+    let awaiting = null
 
     console.log('[session-relay] loaded; threshold=' + prefs.get().threshold)
 
@@ -99,6 +110,28 @@ export default {
       return u && typeof u.context_percent === 'number' ? u.context_percent : null
     }
 
+    /** Give the new chat the previous title with the number incremented. */
+    function applyTitle(storedId, newTitle, retry) {
+      if (!newTitle || typeof host.request !== 'function') {
+        return
+      }
+      host.request('session.title', { session_id: storedId, title: newTitle }).then(
+        res => {
+          const title = String((res && res.title) || '')
+          console.log('[session-relay] title applied: ' + (title || newTitle))
+        },
+        e => {
+          // A chat that went live under its runtime id may need that id instead.
+          const runtimeId = host.state.focusedSessionId && host.state.focusedSessionId.get()
+          if (retry && runtimeId && runtimeId !== storedId) {
+            applyTitle(runtimeId, newTitle, false)
+          } else {
+            console.log('[session-relay] title apply failed', e)
+          }
+        }
+      )
+    }
+
     function watchForSession(storedId, newTitle) {
       // ~2 minute window: 24 ticks × 5 s after an initial 4 s pause.
       let left = 24
@@ -115,10 +148,11 @@ export default {
             r => r && r.id !== storedId && r.source === 'desktop' && (!r.started_at || r.started_at >= t0 - 120)
           )
           if (hit) {
+            applyTitle(hit.id, newTitle, true)
             $relay.set({ phase: 'done', title: newTitle })
-            host.notify({ kind: 'success', message: 'Session relay ready: "' + newTitle + '"' })
+            host.notify({ kind: 'success', message: 'Session relay ready: "' + (newTitle || 'new chat') + '"' })
             try {
-              ctx.os.notify({ title: 'Session relay ready', body: newTitle, activate: '/' + encodeURIComponent(hit.id) })
+              ctx.os.notify({ title: 'Session relay ready', body: newTitle || 'new chat', activate: '/' + encodeURIComponent(hit.id) })
             } catch (e) {
               console.log('[session-relay] os.notify failed', e)
             }
@@ -135,6 +169,65 @@ export default {
         }
       }
       ctx.setTimeout(tick, 4000)
+    }
+
+    /**
+     * Open a fresh chat and submit the hand-off note into it, exactly as the
+     * user would: host.newChat() shows the draft, the composer sends the note.
+     * The draft's composer mounts asynchronously, so the submit is retried
+     * until a live surface claims it (or the window runs out).
+     */
+    function openAndSeed(note) {
+      const a = awaiting
+      awaiting = null
+      if (!a) {
+        return
+      }
+      if (typeof host.newChat !== 'function' || !host.composer || typeof host.composer.submit !== 'function') {
+        $relay.set({ phase: 'idle', title: '' })
+        host.notify({
+          kind: 'error',
+          message: 'Session relay: this Hermes Desktop build cannot open a chat from a plugin. Update Hermes Desktop.'
+        })
+        return
+      }
+      const profileAtom = host.state.focusedSessionProfile
+      const profile = profileAtom && profileAtom.get ? profileAtom.get() : ''
+      try {
+        host.newChat(profile || null)
+      } catch (e) {
+        $relay.set({ phase: 'idle', title: '' })
+        host.notifyError(e, 'Session relay: could not open a new chat.')
+        return
+      }
+      const trySubmit = attempt => {
+        let sent = false
+        try {
+          sent = host.composer.submit('new', note) === true
+        } catch (e) {
+          console.log('[session-relay] composer submit failed', e)
+        }
+        if (sent) {
+          host.notify({
+            kind: 'info',
+            message: a.newTitle
+              ? 'Session relay: "' + a.newTitle + '" starts with the hand-off note.'
+              : 'Session relay: the hand-off note went to the new chat.'
+          })
+          watchForSession(a.storedId, a.newTitle)
+          return
+        }
+        if (attempt < SEED_TRIES) {
+          ctx.setTimeout(() => trySubmit(attempt + 1), SEED_RETRY_MS)
+        } else {
+          $relay.set({ phase: 'idle', title: '' })
+          host.notify({
+            kind: 'warning',
+            message: 'Session relay: the new chat did not open. Copy the hand-off note from this chat, or press ⚡ to retry.'
+          })
+        }
+      }
+      ctx.setTimeout(() => trySubmit(0), 400)
     }
 
     async function relayNow(opts) {
@@ -159,6 +252,12 @@ export default {
       if (!runtimeId || !storedId) {
         if (manual) {
           host.notify({ kind: 'warning', message: 'Session relay: no active session.' })
+        }
+        return
+      }
+      if (awaiting) {
+        if (manual) {
+          host.notify({ kind: 'warning', message: 'Session relay: a hand-off is already being prepared.' })
         }
         return
       }
@@ -218,30 +317,33 @@ export default {
         }
 
         const newTitle = nextTitle(oldTitle)
-        const titleLine = newTitle
-          ? '— title: "' + newTitle + '".'
-          : '— title: choose one yourself that fits the task.'
         const msg = [
           '[Session Relay plugin — service message]',
           'Context usage in this session: ' + (pct == null ? '—' : pct + '%') + '.',
-          'Prepare a hand-off note so the work can continue in a new session, then call start_chat:',
-          '— message: the full hand-off text (current task, state, what has been done, the next step, important details from this conversation);',
-          titleLine,
-          'Do it right away, without clarifying questions; reply in this chat with one short line.'
+          'Write the hand-off note that will continue this work in a fresh session.',
+          'Reply with the note itself as your WHOLE message: the current task, the state, what has been done, the next step, and the important details from this conversation.',
+          'No tools, no preamble, no questions: the plugin opens the new chat itself and puts your reply there as its first message.'
         ].join('\n')
 
+        awaiting = { runtimeId, storedId, newTitle }
         await host.request('prompt.submit', { session_id: runtimeId, text: msg, display_kind: 'hidden' })
         markRelayed(storedId)
         console.log('[session-relay] relay started; new title=' + (newTitle || '(auto)'))
         $relay.set({ phase: 'started', title: newTitle })
         host.notify({
           kind: 'info',
-          message: newTitle ? 'Session relay: preparing "' + newTitle + '"…' : 'Session relay: preparing a new chat…'
+          message: newTitle ? 'Session relay: writing the hand-off for "' + newTitle + '"…' : 'Session relay: writing the hand-off…'
         })
-        if (newTitle) {
-          watchForSession(storedId, newTitle)
-        }
+        // A note that never arrives must not leave the chip spinning forever.
+        ctx.setTimeout(() => {
+          if (awaiting && awaiting.storedId === storedId) {
+            awaiting = null
+            $relay.set({ phase: 'idle', title: '' })
+            host.notify({ kind: 'warning', message: 'Session relay: no hand-off note arrived — press ⚡ to retry.' })
+          }
+        }, NOTE_TIMEOUT_MS)
       } catch (e) {
+        awaiting = null
         lastFailAt = Date.now()
         $relay.set({ phase: 'idle', title: '' })
         host.notifyError(e, 'Session relay: could not start.')
@@ -249,6 +351,27 @@ export default {
         pendingIds.delete(storedId)
       }
     }
+
+    // The agent's reply to the service message IS the hand-off note.
+    ctx.onEvent('message.complete', event => {
+      const a = awaiting
+      if (!a || !event) {
+        return
+      }
+      const sessionId = event.session_id || (event.payload && event.payload.session_id) || ''
+      if (sessionId && sessionId !== a.runtimeId) {
+        return
+      }
+      const payload = event.payload || {}
+      if (payload.status && payload.status !== 'complete') {
+        return
+      }
+      const note = String(payload.text || payload.content || '').trim()
+      if (!note) {
+        return
+      }
+      openAndSeed(note)
+    })
 
     function SettingsPage() {
       const p = useValue(prefs)
@@ -263,7 +386,7 @@ export default {
             checked: p.auto,
             label: 'Automatic relay',
             description:
-              'When the session context reaches the threshold, the agent writes a hand-off note and opens a new chat with the title number incremented (+1).',
+              'When the session context reaches the threshold, the agent writes a hand-off note and the plugin opens a new chat with that note as its first message (the title number is incremented).',
             onChange: on => update({ auto: on })
           }),
           jsx(ListRow, {
@@ -325,7 +448,7 @@ export default {
       const near = pct != null && p && pct >= p.threshold
       const label = working ? '…' : pct == null ? '—' : pct + '%'
       const tip = working
-        ? 'Session relay: preparing "' + (relay.title || 'a new chat') + '"…'
+        ? 'Session relay: writing the hand-off for "' + (relay.title || 'a new chat') + '"…'
         : relay.phase === 'done'
           ? 'Session relay already created: "' + relay.title + '".'
           : pct == null

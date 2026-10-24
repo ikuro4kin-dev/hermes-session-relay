@@ -9,10 +9,11 @@ Hermes compacts a conversation when its context reaches ~50% of the model window
 ## How it works
 
 1. The desktop half watches the focused session's context usage.
-2. When usage crosses the threshold (45% by default) and the current turn has finished, it submits a **hidden service message**: the agent writes a hand-off (current task, state, what was done, next step, important details) and calls `start_chat`.
-3. The new chat is named after the current one with the number incremented — `Bugfix-6` → `Bugfix-7`.
-4. A toast and an OS notification announce the new chat; clicking the notification opens it.
-5. The ⚡ chip in the status bar starts a relay manually, below the threshold too.
+2. When usage crosses the threshold (45% by default) and the current turn has finished, it submits a **hidden service message**: the agent replies with a hand-off note (current task, state, what was done, next step, important details).
+3. The plugin opens a new chat through the SDK (`host.newChat()`) and submits the note into it (`host.composer.submit('new', note)`) — the fresh session starts with the hand-off as its first user message, exactly as if you had typed it.
+4. The new chat is named after the current one with the number incremented — `Bugfix-6` → `Bugfix-7`.
+5. A toast and an OS notification announce the new chat; clicking the notification opens it.
+6. The ⚡ chip in the status bar starts a relay manually, below the threshold too.
 
 Nothing is deleted: the previous session remains in the sidebar as the full record.
 
@@ -21,14 +22,7 @@ On channels outside the desktop app (Telegram and other messaging platforms) the
 ## Requirements
 
 - **Hermes Agent 0.22.0 or newer**, with the Desktop app (`apps/desktop`) and/or the gateway.
-- The `start_chat` tool must be available to the agent. It ships with Hermes but is not listed in every toolset by default; add it to the desktop/CLI toolset in `config.yaml` if a relay reports that `start_chat` is unknown:
-
-  ```yaml
-  platform_toolsets:
-    cli:
-      - ...existing tools...
-      - start_chat
-  ```
+- No agent tool is required: the desktop half opens and seeds the new chat through the plugin SDK (`host.newChat`, `host.composer`), and the gateway half ships its own `session_relay_handoff` tool.
 
 ## Package layout
 
@@ -90,14 +84,14 @@ These channels are manual by design: the plugin cannot watch a context meter fro
 What the plugin does with your data and tokens:
 
 - Each relay submits **one service message to the agent**, which starts a normal agent turn — this consumes model tokens like any other turn.
-- The hand-off text is produced by the agent from the current conversation and passed to `start_chat`; it becomes the first user message of the new session.
+- The hand-off text is produced by the agent from the current conversation and submitted into the new chat's composer; it becomes the first user message of the new session.
 - The desktop half keeps two keys in the plugin's own storage: `prefs` (your settings) and `relayed` (session ids already relayed, pruned after 30 days).
 - The gateway half writes `pending.json` inside its own folder (hand-off text, platform name) and deletes it after the message is injected; entries older than 24 hours are ignored.
 - No network calls, no telemetry, no shell access, no access to files outside its own folder. Everything goes through Hermes's own plugin APIs.
 
 ## Limitations
 
-- Both halves rely on Hermes-internal plugin APIs (`session.context_breakdown`, `prompt.submit`, `start_chat`, and the `pre_command` / `on_session_reset` hooks). A future Hermes release may change them — the plugin would need an update.
+- Both halves rely on Hermes plugin APIs (`session.context_breakdown`, `prompt.submit`, `host.newChat`, `host.composer`, the `message.complete` event, and the `on_session_reset` hook). A future Hermes release may change them — the plugin would need an update.
 - The automatic trigger exists only for the desktop app; Telegram and other gateway channels use the manual flow described above.
 - The relay runs only when the session is idle (it never interrupts a running turn).
 
