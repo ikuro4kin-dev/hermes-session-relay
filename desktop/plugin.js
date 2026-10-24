@@ -34,6 +34,10 @@ const DEFAULTS = { auto: true, threshold: 45 }
 const NOTE_TIMEOUT_MS = 300000
 const SEED_TRIES = 40
 const SEED_RETRY_MS = 500
+// The streamed usage the desktop keeps for the primary chat carries no
+// context_percent (its own gauge asks the gateway for a breakdown instead),
+// so the chip polls the same read-only RPC.
+const PCT_REFRESH_MS = 30000
 
 /** "Bugfix-6" → "Bugfix-7"; a title without a number gets "-2". */
 function nextTitle(raw) {
@@ -61,6 +65,7 @@ export default {
     const storedPrefs = { ...ctx.storage.get('prefs', {}) }
     const prefs = atom({ ...DEFAULTS, ...storedPrefs })
     const $relay = atom({ phase: 'idle', title: '' })
+    const $pct = atom(null)
     const pendingIds = new Set()
     let inFlight = false
     let lastProbeAt = 0
@@ -108,6 +113,25 @@ export default {
       }
       const u = host.state.focusedUsage.get()
       return u && typeof u.context_percent === 'number' ? u.context_percent : null
+    }
+
+    /**
+     * Keep the chip's number in step with the gateway. The value is only
+     * accepted while the same chat is still focused, so a slow answer can
+     * never paint one chat's occupancy onto another.
+     */
+    async function refreshPct() {
+      const runtimeId = host.state.focusedSessionId && host.state.focusedSessionId.get()
+      if (!runtimeId) {
+        $pct.set(null)
+        return null
+      }
+      const pct = await precisePercent(runtimeId)
+      const focused = host.state.focusedSessionId && host.state.focusedSessionId.get()
+      if (focused === runtimeId) {
+        $pct.set(pct == null ? null : pct)
+      }
+      return pct
     }
 
     /** Give the new chat the previous title with the number incremented. */
@@ -282,7 +306,9 @@ export default {
           return
         }
         const u = host.state.focusedUsage.get()
-        const cheap = u && typeof u.context_percent === 'number' ? u.context_percent : null
+        const measured = $pct.get()
+        const cheap =
+          measured != null ? measured : u && typeof u.context_percent === 'number' ? u.context_percent : null
         if (cheap == null) {
           if (Date.now() - lastProbeAt < 60000) {
             return
@@ -375,9 +401,11 @@ export default {
 
     function SettingsPage() {
       const p = useValue(prefs)
+      const measured = useValue($pct)
       const u = useValue(host.state.focusedUsage)
       const storedId = useValue(host.state.focusedStoredSessionId)
-      const pct = u && typeof u.context_percent === 'number' ? u.context_percent : null
+      const streamed = u && typeof u.context_percent === 'number' ? u.context_percent : null
+      const pct = measured != null ? measured : streamed
       const marked = storedId ? Boolean(readRelayed()[storedId]) : false
 
       return jsxs('div', {
@@ -431,14 +459,20 @@ export default {
 
     function Chip() {
       const p = useValue(prefs)
+      const measured = useValue($pct)
       const u = useValue(host.state.focusedUsage)
       const relay = useValue($relay)
       const runtimeId = useValue(host.state.focusedSessionId)
       const storedId = useValue(host.state.focusedStoredSessionId)
       const busyMap = useValue(host.state.busyBySession)
 
-      const pct = u && typeof u.context_percent === 'number' ? u.context_percent : null
+      const streamed = u && typeof u.context_percent === 'number' ? u.context_percent : null
+      const pct = measured != null ? measured : streamed
       const busyNow = Boolean(runtimeId && busyMap && busyMap[runtimeId] === true)
+
+      useEffect(() => {
+        void refreshPct()
+      }, [runtimeId])
 
       useEffect(() => {
         void relayNow({ manual: false })
@@ -476,9 +510,18 @@ export default {
       })
     }
 
+    // The chip must show a number even between turns: poll the same read-only
+    // RPC the desktop's own context gauge uses.
+    const tickPct = () => {
+      void refreshPct()
+      ctx.setTimeout(tickPct, PCT_REFRESH_MS)
+    }
+    ctx.setTimeout(tickPct, 1200)
+
     // Additional trigger: check the threshold after any turn completes.
     ctx.onEvent('message.complete', () => {
       ctx.setTimeout(() => {
+        void refreshPct()
         void relayNow({ manual: false })
       }, 2500)
     })
