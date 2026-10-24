@@ -1,21 +1,24 @@
 """Session Relay for channels outside the desktop app (Telegram and other gateway channels).
 
 Flow:
-  1. In the conversation the agent (on the word "relay"/"handoff") writes the
-     hand-off summary to <this folder>/pending.json:
-         {"platform": "telegram", "text": "<hand-off>"}
-  2. The user sends /new (or /reset).
-  3. The plugin remembers the session_key on pre_command, and after the reset
-     (on_session_reset) injects the hand-off as the first message of the new
-     session (ctx.inject_message) and removes pending.json.
+  1. In a chat the hand-off note is stored with the ``session_relay_handoff``
+     tool: ONE file per chat under ``$HERMES_HOME/plugin-data/session-relay/``.
+     The file name is derived from the chat's session_key and the note carries
+     that key inside.
+  2. The user sends /new (or /reset) in that chat.
+  3. ``on_session_reset`` resolves the resetting chat's session_key from the
+     gateway routing index and reads ONLY that chat's note. It is injected as the
+     first message of the new session (``ctx.inject_message``) and the file is
+     deleted. A note prepared by another chat is never injected, so a shared
+     gateway cannot leak one conversation into another chat's session.
   4. The new session gets the previous title with the number incremented
      ("Bugfix-6" -> "Bugfix-7") unless it already has a title.
 
 Requires in config.yaml (profile default):
   plugins:
-    enabled: [session-relay-gw]
+    enabled: [session-relay]
     entries:
-      session-relay-gw:
+      session-relay:
         allow_gateway_injection: true
 
 Disable: remove it from plugins.enabled and restart the gateway.
@@ -24,22 +27,23 @@ Everything is best-effort: a plugin error never breaks message handling.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_PLUGIN_DIR = Path(__file__).resolve().parent
-_PENDING_FILE = _PLUGIN_DIR / "pending.json"
+_PLUGIN_ID = "session-relay"
 _PENDING_MAX_AGE_S = 24 * 3600  # a prepared hand-off lives for one day
 _TITLE_LIMIT = 40
 
 
 def _next_title(title: str) -> str:
-    """"Bugfix-6" -> "Bugfix-7"; without a number -> "...-2"."""
+    """\"Bugfix-6\" -> \"Bugfix-7\"; without a number -> \"...-2\"."""
     t = (title or "").strip()
     if not t:
         return ""
@@ -55,35 +59,102 @@ def _next_title(title: str) -> str:
     return out[:_TITLE_LIMIT]
 
 
-def _read_pending_text(platform: str):
-    """A fresh prepared hand-off for this platform, or None."""
+def _data_dir() -> Path:
+    """``$HERMES_HOME/plugin-data/session-relay/`` — created on first use.
+
+    Never the plugin install folder: ``hermes plugins update`` git-pulls that and
+    ``remove`` deletes it, so user data must not live there.
+    """
+    from plugins.plugin_storage import plugin_data_dir
+
+    return plugin_data_dir(_PLUGIN_ID)
+
+
+def _pending_path(session_key: str) -> Path:
+    """One file per chat: the hash keeps arbitrary session keys file-safe."""
+    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+    return _data_dir() / f"{digest}.json"
+
+
+def _prune_stale() -> None:
+    """Drop notes no /new picked up within the freshness window."""
+    cutoff = time.time() - _PENDING_MAX_AGE_S
     try:
-        if not _PENDING_FILE.is_file():
+        for entry in _data_dir().glob("*.json"):
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("[session-relay] failed to prune stale hand-offs", exc_info=True)
+
+
+def _write_pending(session_key: str, text: str, platform: str) -> None:
+    """Store this chat's hand-off (atomic replace, one file per session_key)."""
+    path = _pending_path(session_key)
+    payload = {
+        "session_key": session_key,
+        "platform": platform,
+        "text": text,
+        "created_at": time.time(),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    _prune_stale()
+
+
+def _read_pending(session_key: str) -> "str | None":
+    """The fresh hand-off THIS chat prepared, or None. Never another chat's."""
+    path = _pending_path(session_key)
+    try:
+        if not path.is_file():
             return None
-        age = time.time() - _PENDING_FILE.stat().st_mtime
-        if age > _PENDING_MAX_AGE_S:
-            logger.info("[session-relay-gw] pending.json is stale (%.0f h) - skipping", age / 3600.0)
-            return None
-        data = json.loads(_PENDING_FILE.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return None
-        want = str(data.get("platform") or "").strip().lower()
-        have = str(platform or "").strip().lower()
-        if want and have and want != have:
-            logger.info("[session-relay-gw] pending is for platform %r but the reset is on %r - skipping", want, have)
+        if str(data.get("session_key") or "") != session_key:
+            logger.warning("[session-relay] hand-off file %s names another chat - skipping", path.name)
+            return None
+        age = time.time() - float(data.get("created_at") or path.stat().st_mtime)
+        if age > _PENDING_MAX_AGE_S:
+            logger.info("[session-relay] this chat's hand-off is stale (%.0f h) - dropping", age / 3600.0)
+            path.unlink(missing_ok=True)
             return None
         text = str(data.get("text") or "").strip()
         return text or None
     except Exception:
-        logger.debug("[session-relay-gw] failed to read pending.json", exc_info=True)
+        logger.debug("[session-relay] failed to read the chat's hand-off", exc_info=True)
         return None
 
 
-def _remove_pending() -> None:
+def _remove_pending(session_key: str) -> None:
     try:
-        _PENDING_FILE.unlink(missing_ok=True)
+        _pending_path(session_key).unlink(missing_ok=True)
     except Exception:
-        logger.debug("[session-relay-gw] failed to remove pending.json", exc_info=True)
+        logger.debug("[session-relay] failed to remove the chat's hand-off", exc_info=True)
+
+
+def _reset_session_key(old_session_id, new_session_id) -> str:
+    """The route key of the chat ``/new`` just reset, "" when it can't be read.
+
+    ``on_session_reset`` fires without a session_key (only session ids and the
+    platform), so the key is read back from the gateway routing index: the row
+    owning the reset session IS this chat's row. The old id is tried first — the
+    row may still point at it if the persistence write has not landed yet.
+    """
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        for sid in (old_session_id, new_session_id):
+            if not sid:
+                continue
+            entry = db.gateway_routing_entry_for_session(str(sid))
+            key = str((entry or {}).get("session_key") or "").strip()
+            if key:
+                return key
+    except Exception:
+        logger.debug("[session-relay] could not resolve the resetting chat", exc_info=True)
+    return ""
 
 
 def _apply_incremented_title(old_session_id, new_session_id) -> None:
@@ -101,59 +172,40 @@ def _apply_incremented_title(old_session_id, new_session_id) -> None:
         new_title = _next_title(old)
         if new_title:
             db.set_session_title(new_session_id, new_title)
-            logger.info("[session-relay-gw] session title: %r -> %r", old, new_title)
+            logger.info("[session-relay] session title: %r -> %r", old, new_title)
     except Exception:
-        logger.debug("[session-relay-gw] failed to set the session title", exc_info=True)
+        logger.debug("[session-relay] failed to set the session title", exc_info=True)
 
 
 def register(ctx) -> None:
     """Called once by the plugin loader."""
-    state = {"session_key": None, "platform": ""}
-
-    def _on_pre_command(*, surface="", command="", alias_used="", args_raw="",
-                        session_key=None, platform=None, **_kw) -> None:
-        """Remember the session_key on /new or /reset (before the reset)."""
-        try:
-            cmd = str(command or "").strip().lower().lstrip("/")
-            if cmd in ("new", "reset") and session_key:
-                state["session_key"] = str(session_key)
-                state["platform"] = str(platform or "")
-                logger.info("[session-relay-gw] /%s: session_key=%s platform=%s",
-                            cmd, state["session_key"], state["platform"])
-        except Exception:
-            logger.debug("[session-relay-gw] pre_command failed", exc_info=True)
 
     def _on_session_reset(*, session_id=None, reason="", platform="",
                           old_session_id=None, new_session_id=None, **_kw) -> None:
-        """After /new: inject the prepared hand-off into the new session."""
+        """After /new: inject THAT chat's prepared hand-off into the new session."""
         try:
-            key = state["session_key"]
-            plat = state["platform"] or platform
-            state["session_key"] = None
-            state["platform"] = ""
-
-            text = _read_pending_text(plat)
-            if not text:
-                return
+            key = _reset_session_key(old_session_id, new_session_id)
             if not key:
-                logger.info("[session-relay-gw] hand-off exists but no session_key was captured "
-                            "(reset while the agent was busy?) - keeping pending.json")
+                logger.info("[session-relay] /new on %s: cannot tell which chat was reset - "
+                            "no hand-off injected", platform or "?")
+                return
+            text = _read_pending(key)
+            if not text:
                 return
 
             accepted = False
             try:
                 accepted = bool(ctx.inject_message(text, role="user", session_key=key))
             except Exception:
-                logger.warning("[session-relay-gw] inject_message failed", exc_info=True)
+                logger.warning("[session-relay] inject_message failed", exc_info=True)
 
-            logger.info("[session-relay-gw] hand-off after /new: session=%s platform=%s accepted=%s",
-                        key, plat, accepted)
+            logger.info("[session-relay] hand-off after /new: session=%s platform=%s accepted=%s",
+                        key, platform or "?", accepted)
             if accepted:
-                _remove_pending()
+                _remove_pending(key)
                 _apply_incremented_title(old_session_id, new_session_id)
         except Exception:
-            logger.debug("[session-relay-gw] on_session_reset failed", exc_info=True)
+            logger.debug("[session-relay] on_session_reset failed", exc_info=True)
 
-    ctx.register_hook("pre_command", _on_pre_command)
     ctx.register_hook("on_session_reset", _on_session_reset)
-    logger.info("[session-relay-gw] plugin loaded (pending: %s)", _PENDING_FILE)
+    logger.info("[session-relay] plugin loaded (hand-offs: %s)", _data_dir())
