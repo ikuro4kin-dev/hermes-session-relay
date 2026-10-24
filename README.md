@@ -72,11 +72,13 @@ This puts the package in `$HERMES_HOME/plugins/session-relay/`. Then:
 
 ## Using the gateway half (Telegram and other channels)
 
-1. Ask the agent for a relay / hand-off for the current conversation.
+1. Ask the agent for a relay / hand-off for the current conversation. It calls the **`session_relay_handoff`** tool with the note as `text`; the note is stored in `$HERMES_HOME/plugin-data/session-relay/` under the chat's session id.
 2. Send `/new` (or `/reset`).
 3. The plugin injects the prepared hand-off as the first user message of the new session and gives it the previous title with the number incremented.
-4. A hand-off is keyed by the chat that prepared it (`session_key`): only that chat's `/new` can pick it up — a note written in another conversation on the same platform is never injected.
+4. A hand-off is bound to the chat that prepared it (its session id): only that chat's `/new` can pick it up — a note written in another conversation is never injected.
 5. A prepared hand-off is valid for 24 hours; if it is older, it is ignored.
+
+The tool lives in the `session_relay` toolset. It is enabled with the plugin; if you turned the toolset off in `hermes tools`, turn it back on for the platform you use.
 
 These channels are manual by design: the plugin cannot watch a context meter from the gateway side.
 
@@ -87,7 +89,7 @@ What the plugin does with your data and tokens:
 - Each relay submits **one service message to the agent**, which starts a normal agent turn — this consumes model tokens like any other turn.
 - The hand-off text is produced by the agent from the current conversation and submitted into the new chat's composer; it becomes the first user message of the new session.
 - The desktop half keeps two keys in the plugin's own storage: `prefs` (your settings) and `relayed` (session ids already relayed, pruned after 30 days).
-- The gateway half writes one hand-off file per chat under `$HERMES_HOME/plugin-data/session-relay/` (hand-off text, the chat's `session_key`, platform, timestamp) and deletes it after the message is injected; files older than 24 hours are pruned.
+- The gateway half writes one hand-off file per chat under `$HERMES_HOME/plugin-data/session-relay/` (hand-off text, the chat's session id, timestamp) and deletes it after the message is injected; files older than 24 hours are pruned.
 - No network calls, no telemetry, no shell access, no access to files outside the plugin's own folder and its `plugin-data` directory. Everything goes through Hermes's own plugin APIs.
 
 ## Limitations
