@@ -234,7 +234,10 @@ def register(ctx) -> None:
             text = _read_pending(retired)
             if not text:
                 return
-            route = _routing_key_for_session(retired)
+            fresh = str(new_session_id or "").strip()
+            # /new has already moved this chat's routing row to the new session id, so the
+            # retired id no longer owns a row: resolve by the successor first, then fall back.
+            route = (_routing_key_for_session(fresh) if fresh else "") or _routing_key_for_session(retired)
             if not route:
                 logger.info("[session-relay] hand-off for session %s is kept: its chat has no "
                             "routing key recorded", retired)

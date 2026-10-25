@@ -385,7 +385,8 @@ export default {
         return
       }
       const sessionId = event.session_id || (event.payload && event.payload.session_id) || ''
-      if (sessionId && sessionId !== a.runtimeId) {
+      // The note must come from THIS chat's turn: an event with no session id is not a match.
+      if (sessionId !== a.runtimeId) {
         return
       }
       const payload = event.payload || {}
