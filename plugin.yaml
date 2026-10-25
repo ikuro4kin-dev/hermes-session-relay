@@ -1,7 +1,8 @@
 name: session-relay
-version: 0.2.1
-description: "Session Relay: hands a long-running chat over to a fresh session before the context window fills up. Desktop part watches context usage; the agent replies with a hand-off note and the plugin opens a new chat seeded with it. The gateway part provides the session_relay_handoff tool and injects that chat's note into the new session after /new (Telegram and other messaging platforms)."
+version: 0.3.0
+description: "Session Relay: hands a long-running chat over to a fresh session before the context window fills up. Desktop part watches context usage; the agent replies with a hand-off note and the plugin opens a new chat seeded with it. The gateway part provides the session_relay_handoff tool and, after /new on Telegram and other messaging platforms, attaches that chat's note to the first message of the new session."
 provides_tools:
   - session_relay_handoff
 provides_hooks:
   - on_session_reset
+  - pre_gateway_dispatch

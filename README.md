@@ -17,7 +17,7 @@ Hermes compacts a conversation when its context reaches ~50% of the model window
 
 Nothing is deleted: the previous session remains in the sidebar as the full record.
 
-On channels outside the desktop app (Telegram and other messaging platforms) the flow is manual: the agent prepares the hand-off, you send `/new`, and the gateway half injects it as the first message of the new session.
+On channels outside the desktop app (Telegram and other messaging platforms) the flow is manual: the agent prepares the hand-off, you send `/new`, and the gateway half attaches the note to the first ordinary message you send in the new session — that message opens with the hand-off as its heading block.
 
 ## Requirements
 
@@ -31,7 +31,7 @@ This is a **unified package**: one plugin, two halves.
 ```
 session-relay/
 ├── plugin.yaml      # manifest (name, version, declared hooks/tools)
-├── __init__.py      # gateway half: per-chat hand-off store + injection after /new
+├── __init__.py      # gateway half: per-chat hand-off store, carry after /new, pre_gateway_dispatch hook
 └── desktop/
     └── plugin.js    # desktop half: context meter, threshold, service message
 ```
@@ -74,9 +74,10 @@ This puts the package in `$HERMES_HOME/plugins/session-relay/`. Then:
 
 1. Ask the agent for a relay / hand-off for the current conversation. It calls the **`session_relay_handoff`** tool with the note as `text`; the note is stored in `$HERMES_HOME/plugin-data/session-relay/` under the chat's session id.
 2. Send `/new` (or `/reset`).
-3. The plugin injects the prepared hand-off as the first user message of the new session and gives it the previous title with the number incremented.
-4. A hand-off is bound to the chat that prepared it (its session id): only that chat's `/new` can pick it up — a note written in another conversation is never injected.
-5. A prepared hand-off is valid for 24 hours; if it is older, it is ignored.
+3. The plugin parks the prepared hand-off for this chat and gives the new session the previous title with the number incremented.
+4. Your next ordinary message in that chat — not a command — opens with the hand-off as its heading block. This is deliberate: a brand-new session has not committed a turn yet, and the gateway's session authority refuses to seed one (`not_found`), so the note rides the first real message instead of being lost.
+5. A hand-off is bound to the chat that prepared it (its session id): only that chat can pick it up — a note written in another conversation is never attached. A parked note is dropped when the chat has moved on (another `/new`, a restored session).
+6. A prepared hand-off is valid for 24 hours; if it is older, it is ignored.
 
 The tool lives in the `session_relay` toolset. It is enabled with the plugin; if you turned the toolset off in `hermes tools`, turn it back on for the platform you use.
 
@@ -89,12 +90,12 @@ What the plugin does with your data and tokens:
 - Each relay submits **one service message to the agent**, which starts a normal agent turn — this consumes model tokens like any other turn.
 - The hand-off text is produced by the agent from the current conversation and submitted into the new chat's composer; it becomes the first user message of the new session.
 - The desktop half keeps two keys in the plugin's own storage: `prefs` (your settings) and `relayed` (session ids already relayed, pruned after 30 days).
-- The gateway half writes one hand-off file per chat under `$HERMES_HOME/plugin-data/session-relay/` (hand-off text, the chat's session id, timestamp) and deletes it after the message is injected; files older than 24 hours are pruned.
+- The gateway half writes one hand-off file per chat under `$HERMES_HOME/plugin-data/session-relay/` (hand-off text, the chat's session id, timestamp); after `/new` it moves the note into a per-chat carry file and deletes it once the chat's next message has picked it up (or when the chat has moved on). Files older than 24 hours are pruned.
 - No network calls, no telemetry, no shell access, no access to files outside the plugin's own folder and its `plugin-data` directory. Everything goes through Hermes's own plugin APIs.
 
 ## Limitations
 
-- Both halves rely on Hermes plugin APIs (`session.context_breakdown`, `prompt.submit`, `host.newChat`, `host.composer`, the `message.complete` event, and the `on_session_reset` hook). A future Hermes release may change them — the plugin would need an update.
+- Both halves rely on Hermes plugin APIs (`session.context_breakdown`, `prompt.submit`, `host.newChat`, `host.composer`, the `message.complete` event, and the `on_session_reset` + `pre_gateway_dispatch` hooks). A future Hermes release may change them — the plugin would need an update.
 - The automatic trigger exists only for the desktop app; Telegram and other gateway channels use the manual flow described above.
 - The relay runs only when the session is idle (it never interrupts a running turn).
 
