@@ -1,6 +1,13 @@
 """Session Relay for channels outside the desktop app (Telegram and other gateway channels).
 
 Flow:
+  0. Automatic mode (opt-in): a watchdog thread watches every routed chat on the
+     configured platforms. When a chat's last API call shows its context is past
+     ``auto_threshold_percent`` of the model's window, the chat has been idle for
+     ``auto_min_idle_seconds`` and no turn is in flight, the plugin injects one
+     service turn that asks the agent to write the hand-off; as soon as the note
+     exists and the turn is over, the chat's session is reset through the
+     gateway's own ``/new`` funnel. The user does nothing.
   1. In a chat the agent stores the hand-off note with the ``session_relay_handoff``
      tool: ONE file per chat under ``$HERMES_HOME/plugin-data/session-relay/``.
      The file name is derived from the chat's session id — the id the plugin
@@ -32,11 +39,14 @@ Everything is best-effort: a plugin error never breaks message handling.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -51,6 +61,39 @@ _CARRY_DIRNAME = "carry"
 # driven in-process (CLI/TUI/Desktop), so the note is injected instead.
 _INPROCESS_PLATFORMS = frozenset({"local", "cli", "tui"})
 _CARRY_HEADER = "⚡ Hand-off from the previous session (auto-relay)."
+
+# ---- automatic hand-off (watchdog) -------------------------------------------------------------
+# Off unless the operator turns it on. Every value is read from
+# plugins.entries.session-relay.settings.<key> on each tick, so `hermes config set` is a live switch.
+_AUTO_DEFAULTS = {
+    "auto_handoff": False,
+    "auto_threshold_percent": 45.0,
+    "auto_min_idle_seconds": 60.0,
+    "auto_poll_seconds": 60.0,
+    "auto_channels": ["telegram"],
+}
+# One note per session, and the reset that follows it, live here so a gateway restart cannot
+# fire the same relay twice.
+_AUTO_STATE_FILE = "auto_state.json"
+_AUTO_STATE_MAX_AGE_S = 24 * 3600
+_AUTO_TRIGGER_TIMEOUT_S = 10 * 60  # the agent gets this long to write the note
+_LOG_TAIL_BYTES = 3 * 1024 * 1024
+
+_LOG_HEAD_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ .*?\[(?P<sid>[^\]]+)\]")
+_API_CALL_RE = re.compile(
+    r"agent\.conversation_loop: API call #\d+: model=(?P<model>\S+) provider=\S+ in=(?P<tokens>\d+)")
+_TURN_RE = re.compile(
+    r"agent\.turn_context: conversation turn: session=\S+ .*?platform=(?P<platform>\S+)")
+
+_AUTO_TRIGGER_TEXT = (
+    "[service: automatic context relay] This chat's context is about {pct:.0f}% full.\n"
+    "Write a short hand-off note for the next session: the current task, what has been done, what is "
+    "still open, the next step, and any detail that would otherwise be lost.\n"
+    "Store it with the `session_relay_handoff` tool (text=<the note>) and then reply to the user, in the "
+    "language of this conversation, with exactly one short line: "
+    "\"⚡ Context is almost full — hand-off saved, continuing in a fresh session.\"\n"
+    "Do not research anything and do not call any other tool."
+)
 
 _TOOL_SCHEMA = {
     "name": _TOOL_NAME,
@@ -287,6 +330,342 @@ def _tool_handoff(args: dict, *, session_id: str = "", **_kwargs) -> str:
         return json.dumps({"ok": False, "error": f"could not store the hand-off: {exc}"})
 
 
+# ---- automatic hand-off: watchdog, trigger, reset ---------------------------------------------
+
+
+def _auto_setting(ctx, key: str):
+    """One ``auto_*`` setting, read fresh so ``hermes config set`` is a live switch."""
+    default = _AUTO_DEFAULTS[key]
+    try:
+        raw = ctx.get_config(key, default)
+    except Exception:
+        return default
+    if isinstance(default, bool):
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
+    if isinstance(default, list):
+        if isinstance(raw, str):
+            return [part.strip() for part in raw.split(",") if part.strip()]
+        if isinstance(raw, (list, tuple)):
+            return [str(part).strip() for part in raw if str(part).strip()]
+        return list(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _agent_log_path() -> Path:
+    """``$HERMES_HOME/logs/agent.log`` — derived from the plugin data dir."""
+    try:
+        return _data_dir().parent.parent / "logs" / "agent.log"
+    except Exception:
+        return Path("")
+
+
+def _scan_log(path: Path) -> "dict[str, dict]":
+    """Per-session facts from the tail of ``agent.log``: last activity, last API prompt size,
+    the model, and which surface drove the last turn. Read-only, best effort."""
+    out: "dict[str, dict]" = {}
+    if not path or not path.is_file():
+        return out
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - _LOG_TAIL_BYTES))
+            chunk = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return out
+    for line in chunk.splitlines():
+        head = _LOG_HEAD_RE.match(line)
+        if not head:
+            continue
+        sid = head.group("sid")
+        try:
+            ts = time.mktime(time.strptime(head.group("ts"), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        rec = out.setdefault(sid, {})
+        rec["last_ts"] = max(float(rec.get("last_ts") or 0.0), ts)
+        api = _API_CALL_RE.search(line)
+        if api:
+            rec["model"] = api.group("model")
+            rec["tokens"] = int(api.group("tokens"))
+        turn = _TURN_RE.search(line)
+        if turn:
+            rec["platform"] = turn.group("platform")
+    return out
+
+
+_CONTEXT_LIMITS: "dict[str, int]" = {}
+
+
+def _context_limit(model: str) -> int:
+    """Context window for a model, cached per process; 0 when unknown."""
+    if not model:
+        return 0
+    if model in _CONTEXT_LIMITS:
+        return _CONTEXT_LIMITS[model]
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        limit = int(get_model_context_length(model) or 0)
+    except Exception:
+        logger.debug("[session-relay] could not resolve the context length for %s", model, exc_info=True)
+        limit = 0
+    if limit > 0:
+        _CONTEXT_LIMITS[model] = limit
+    return limit
+
+
+def _auto_state_path() -> Path:
+    return _data_dir() / _AUTO_STATE_FILE
+
+
+def _load_auto_state() -> dict:
+    path = _auto_state_path()
+    try:
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        cutoff = time.time() - _AUTO_STATE_MAX_AGE_S
+        return {str(k): v for k, v in data.items()
+                if isinstance(v, dict) and float(v.get("ts") or 0) > cutoff}
+    except Exception:
+        logger.debug("[session-relay] failed to read the auto state", exc_info=True)
+        return {}
+
+
+def _save_auto_state(state: dict) -> None:
+    path = _auto_state_path()
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug("[session-relay] failed to write the auto state", exc_info=True)
+
+
+class _CommandFreeEvent:
+    """The ``/new`` funnel reads ``event.source`` and ``event.get_command_args()`` only.
+
+    A bare stand-in keeps the auto reset identical to a typed ``/new`` with no title: no text
+    means nothing is taken for the new session's name.
+    """
+
+    __slots__ = ("source", "text", "internal", "metadata")
+
+    def __init__(self, source) -> None:
+        self.source = source
+        self.text = ""
+        self.internal = True
+        self.metadata: dict = {}
+
+    def get_command_args(self) -> str:
+        return ""
+
+
+def _gateway_runner():
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        return _gateway_runner_ref()
+    except Exception:
+        return None
+
+
+def _running_keys(runner) -> "set[str]":
+    """Routing keys with a turn in flight: never touch a session while it works."""
+    try:
+        return {str(key) for key in list(getattr(runner, "_running_agents", {}) or {})}
+    except Exception:
+        return set()
+
+
+async def _reset_session_now(runner, source) -> None:
+    """Run the gateway's own ``/new`` reset funnel for *source*."""
+    event = _CommandFreeEvent(source)
+    funnel = getattr(runner, "_handle_reset_command", None)
+    if callable(funnel):
+        outcome = funnel(event)
+        if inspect.isawaitable(outcome):
+            await outcome
+        return
+    raise RuntimeError("the gateway reset funnel is not reachable")
+
+
+def _schedule_reset(runner, entry) -> bool:
+    """Reset this chat's session on the gateway loop; True when the funnel returned."""
+    loop = getattr(runner, "_gateway_loop", None)
+    if loop is None or loop.is_closed():
+        return False
+    try:
+        source = runner._restored_source(entry)
+    except Exception:
+        logger.debug("[session-relay] could not restore the source of %s",
+                     getattr(entry, "session_key", "?"), exc_info=True)
+        return False
+    if source is None:
+        return False
+    try:
+        future = asyncio.run_coroutine_threadsafe(_reset_session_now(runner, source), loop)
+    except Exception:
+        logger.warning("[session-relay] could not schedule the auto reset", exc_info=True)
+        return False
+    if future is None:
+        return False
+    try:
+        future.result(timeout=45)
+    except Exception:
+        logger.warning("[session-relay] the auto reset failed", exc_info=True)
+        return False
+    return True
+
+
+def _inject_trigger(ctx, route: str, pct: float) -> bool:
+    """Ask the agent to write the hand-off now; the note lands in this chat's file."""
+    try:
+        return bool(ctx.inject_message(_AUTO_TRIGGER_TEXT.format(pct=pct), role="user", session_key=route))
+    except Exception:
+        logger.warning("[session-relay] auto trigger injection failed", exc_info=True)
+        return False
+
+
+def _auto_tick(ctx) -> None:
+    """One watchdog pass: trigger a relay when a chat is full and idle, then reset it."""
+    if not _auto_setting(ctx, "auto_handoff"):
+        return
+    runner = _gateway_runner()
+    if runner is None:
+        return
+    store = getattr(runner, "session_store", None) or getattr(runner, "async_session_store", None)
+    if store is None:
+        return
+    channels = set(_auto_setting(ctx, "auto_channels"))
+    threshold = _auto_setting(ctx, "auto_threshold_percent")
+    idle = _auto_setting(ctx, "auto_min_idle_seconds")
+    now = time.time()
+    running = _running_keys(runner)
+    state = _load_auto_state()
+    changed = False
+
+    # Phase 1: relays already triggered — reset once the note exists and the turn is over.
+    for sid, stage in list(state.items()):
+        if str(stage.get("stage") or "") != "triggered":
+            continue
+        route = str(stage.get("route") or "")
+        if not route:
+            state.pop(sid, None)
+            changed = True
+            continue
+        if now - float(stage.get("ts") or 0) > _AUTO_TRIGGER_TIMEOUT_S:
+            logger.info("[session-relay] auto relay for %s timed out: no hand-off was written", sid)
+            state.pop(sid, None)
+            changed = True
+            continue
+        if route in running or not _pending_path(sid).is_file():
+            continue
+        try:
+            entry = store.lookup_by_session_key(route)
+        except Exception:
+            entry = None
+        if entry is None or str(getattr(entry, "session_id", "") or "") != sid:
+            state.pop(sid, None)  # the chat has moved on already
+            changed = True
+            continue
+        if _schedule_reset(runner, entry):
+            stage["stage"] = "resetting"
+            stage["ts"] = now
+            changed = True
+            logger.info("[session-relay] auto relay: resetting %s (route=%s)", sid, route)
+
+    # Phase 2: a reset was requested — forget the session once the route points elsewhere.
+    for sid, stage in list(state.items()):
+        if str(stage.get("stage") or "") != "resetting":
+            continue
+        route = str(stage.get("route") or "")
+        try:
+            entry = store.lookup_by_session_key(route) if route else None
+        except Exception:
+            entry = None
+        if entry is None or str(getattr(entry, "session_id", "") or "") != sid:
+            state.pop(sid, None)
+            changed = True
+        elif now - float(stage.get("ts") or 0) > _AUTO_TRIGGER_TIMEOUT_S:
+            state.pop(sid, None)
+            changed = True
+
+    # Phase 3: new candidates.
+    scan = _scan_log(_agent_log_path())
+    if scan:
+        try:
+            entries = store.list_sessions()
+        except Exception:
+            entries = []
+        for entry in entries:
+            sid = str(getattr(entry, "session_id", "") or "")
+            route = str(getattr(entry, "session_key", "") or "")
+            if not sid or not route or sid in state:
+                continue
+            origin = getattr(entry, "origin", None)
+            platform = str(getattr(getattr(origin, "platform", None), "value", "") or "")
+            if platform not in channels:
+                continue
+            rec = scan.get(sid) or {}
+            if not rec:
+                continue
+            # Cross-channel guard: a session the desktop drove last must not be reset here.
+            if rec.get("platform") and str(rec["platform"]) != platform:
+                continue
+            if route in running:
+                continue
+            if now - float(rec.get("last_ts") or 0.0) < idle:
+                continue
+            limit = _context_limit(str(rec.get("model") or ""))
+            tokens = int(rec.get("tokens") or 0)
+            if limit <= 0 or tokens <= 0:
+                continue
+            pct = 100.0 * tokens / limit
+            if pct < threshold:
+                continue
+            if not _inject_trigger(ctx, route, pct):
+                continue
+            state[sid] = {"stage": "triggered", "ts": now, "route": route, "platform": platform}
+            changed = True
+            logger.info("[session-relay] auto relay: %s is at %.0f%% of %d tokens — trigger sent (route=%s)",
+                        sid, pct, limit, route)
+
+    if changed:
+        _save_auto_state(state)
+
+
+def _start_watchdog(ctx) -> threading.Event:
+    """Background thread that ticks while the gateway lives; a no-op unless enabled."""
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.is_set():
+            try:
+                _auto_tick(ctx)
+            except Exception:
+                logger.debug("[session-relay] auto hand-off tick failed", exc_info=True)
+            try:
+                tick = max(5.0, float(_auto_setting(ctx, "auto_poll_seconds")))
+            except Exception:
+                tick = 60.0
+            stop.wait(tick)
+
+    thread = threading.Thread(target=_loop, name="session-relay-watchdog", daemon=True)
+    thread.start()
+    logger.info("[session-relay] auto hand-off watchdog started (enabled=%s)",
+                _auto_setting(ctx, "auto_handoff"))
+    return stop
+
+
 def register(ctx) -> None:
     """Called once by the plugin loader."""
 
@@ -381,4 +760,9 @@ def register(ctx) -> None:
     )
     ctx.register_hook("on_session_reset", _on_session_reset)
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    try:
+        stop_watchdog = _start_watchdog(ctx)
+        ctx.on_unload(stop_watchdog.set)
+    except Exception:
+        logger.warning("[session-relay] could not start the auto hand-off watchdog", exc_info=True)
     logger.info("[session-relay] plugin loaded (hand-offs: %s, tool: %s)", _data_dir(), _TOOL_NAME)

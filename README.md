@@ -81,7 +81,34 @@ This puts the package in `$HERMES_HOME/plugins/session-relay/`. Then:
 
 The tool lives in the `session_relay` toolset. It is enabled with the plugin; if you turned the toolset off in `hermes tools`, turn it back on for the platform you use.
 
-These channels are manual by design: the plugin cannot watch a context meter from the gateway side.
+## Automatic hand-off on messaging channels
+
+Opt-in and off by default. When enabled, a watchdog thread inside the gateway checks every routed chat on the configured platforms once a tick:
+
+- **context** — the size of the chat's last API call as a share of the model's context window (read from the tail of `logs/agent.log`);
+- **quiet** — no turn for at least `auto_min_idle_seconds`, and no turn in flight for that chat;
+- **same surface** — the last turn of that session was driven by that same platform, so a session the desktop drove is never reset here.
+
+Past the threshold the plugin sends one service turn that asks the agent to write the hand-off. As soon as the note is stored and the turn is over, the chat's session is reset through the gateway's own `/new` funnel (no title, no text). Your next ordinary message in that chat opens with the hand-off — the same carry step the manual flow uses. Nothing is injected, reset or rewritten while a turn is running.
+
+Settings live under `plugins.entries.session-relay.settings`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `auto_handoff` | `false` | Master switch; read on every tick, so it needs no restart. |
+| `auto_threshold_percent` | `45` | Share of the model's context window that triggers the relay. |
+| `auto_min_idle_seconds` | `60` | The chat must have been quiet for this long. |
+| `auto_poll_seconds` | `60` | Watchdog tick. |
+| `auto_channels` | `["telegram"]` | Platforms to watch (`telegram`, `api_server`, …). |
+
+Set them with `hermes config set`, for example:
+
+```
+hermes config set plugins.entries.session-relay.settings.auto_handoff true
+hermes config set plugins.entries.session-relay.settings.auto_threshold_percent 45
+```
+
+A session is relayed at most once per day: the watchdog remembers the session ids it triggered in `auto_state.json` in the plugin's own data folder, so a gateway restart cannot fire the same relay twice.
 
 ## Disclosure
 
@@ -91,12 +118,13 @@ What the plugin does with your data and tokens:
 - The hand-off text is produced by the agent from the current conversation and submitted into the new chat's composer; it becomes the first user message of the new session.
 - The desktop half keeps two keys in the plugin's own storage: `prefs` (your settings) and `relayed` (session ids already relayed, pruned after 30 days).
 - The gateway half writes one hand-off file per chat under `$HERMES_HOME/plugin-data/session-relay/` (hand-off text, the chat's session id, timestamp); after `/new` it moves the note into a per-chat carry file and deletes it once the chat's next message has picked it up (or when the chat has moved on). Files older than 24 hours are pruned.
-- No network calls, no telemetry, no shell access, no access to files outside the plugin's own folder and its `plugin-data` directory. Everything goes through Hermes's own plugin APIs.
+- The automatic watchdog reads the **tail of `logs/agent.log`** (session id, size of the last API call, model, platform) to decide whether a chat is full; it writes `auto_state.json` in its own data folder (session ids already relayed, pruned after 24 hours). It never reads message text and never leaves the machine.
+- No network calls, no telemetry, no shell access, no access to files outside the plugin's own folder, its `plugin-data` directory and the log tail above. Everything else goes through Hermes's own plugin APIs.
 
 ## Limitations
 
 - Both halves rely on Hermes plugin APIs (`session.context_breakdown`, `prompt.submit`, `host.newChat`, `host.composer`, the `message.complete` event, and the `on_session_reset` + `pre_gateway_dispatch` hooks). A future Hermes release may change them — the plugin would need an update.
-- The automatic trigger exists only for the desktop app; Telegram and other gateway channels use the manual flow described above.
+- The automatic trigger works on the desktop and, opt-in, on gateway channels (`auto_handoff`). The gateway half measures context from the log line Hermes writes after each API call; a release that renames that line would leave the watchdog idle while the manual flow keeps working.
 - The relay runs only when the session is idle (it never interrupts a running turn).
 
 ## License
