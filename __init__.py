@@ -50,7 +50,7 @@ _CARRY_DIRNAME = "carry"
 # Gateways that cannot receive a rewritten inbound message: their sessions are
 # driven in-process (CLI/TUI/Desktop), so the note is injected instead.
 _INPROCESS_PLATFORMS = frozenset({"local", "cli", "tui"})
-_CARRY_HEADER = "⚡ Передача из прошлой сессии (авто-подхват)."
+_CARRY_HEADER = "⚡ Hand-off from the previous session (auto-relay)."
 
 _TOOL_SCHEMA = {
     "name": _TOOL_NAME,
