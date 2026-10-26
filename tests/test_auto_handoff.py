@@ -189,6 +189,20 @@ ctx10, calls10 = run(BASE, Store([Entry("route1", "sid7", "telegram")]), log)
 state = json.loads(mod._auto_state_path().read_text(encoding="utf-8"))
 check("a trigger that never produced a note expires", "sid7" not in state)
 
+# 12. the chat spoke after the note -> the stale note is dropped and nothing is reset
+fresh_state()
+note8 = mod._pending_path("sid8")
+note8.parent.mkdir(parents=True, exist_ok=True)
+note8.write_text(json.dumps({"session_id": "sid8", "text": "old", "created_at": time.time()}),
+                 encoding="utf-8")
+os.utime(note8, (time.time() - 300, time.time() - 300))
+mod._save_auto_state({"sid8": {"stage": "triggered", "ts": time.time() - 60, "route": "route1"}})
+write_log(log, "sid8", "telegram", 800, 5)  # the chat spoke 5 seconds ago, after the note
+ctx11, calls11 = run(BASE, Store([Entry("route1", "sid8", "telegram")]), log)
+state = json.loads(mod._auto_state_path().read_text(encoding="utf-8"))
+check("a note older than the chat's last words is dropped", "sid8" not in state and not note8.exists())
+check("nothing is reset with a stale note", calls11 == [])
+
 failed = [n for n, good in ok if not good]
 print()
 print(f"{len(ok)} checks, {len(failed)} failed")
