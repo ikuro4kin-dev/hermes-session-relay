@@ -95,6 +95,18 @@ _AUTO_TRIGGER_TEXT = (
     "Do not research anything and do not call any other tool."
 )
 
+_AUTO_WEB_TRIGGER_TEXT = (
+    "[service: automatic context relay] This web session's context is about {pct:.0f}% full.\n"
+    "Write a short hand-off note for the next session: the current task, what has been done, what is "
+    "still open, the next step, and any detail that would otherwise be lost.\n"
+    "Put that note in your answer as ONE fenced block that opens with ```relay-web-auto and closes "
+    "with ``` — nothing else inside the block, and nothing but the block in the answer, in the "
+    "language of this conversation.\n"
+    "The web page moves itself to a fresh session and carries the block over; no reset is needed "
+    "on the server.\n"
+    "Do not research anything and do not call any tools."
+)
+
 _TOOL_SCHEMA = {
     "name": _TOOL_NAME,
     "description": (
@@ -539,6 +551,66 @@ def _inject_trigger(ctx, route: str, pct: float) -> bool:
         return False
 
 
+def _api_server_adapter(runner):
+    """The live api_server adapter, or None when this gateway does not serve HTTP turns."""
+    try:
+        from gateway.config import Platform
+
+        return (getattr(runner, "adapters", {}) or {}).get(Platform.API_SERVER)
+    except Exception:
+        logger.debug("[session-relay] could not reach the api_server adapter", exc_info=True)
+        return None
+
+
+def _profile_for_session(session_id: str) -> str:
+    """The profile that owns a raw web session id (the in-process wake needs it proved)."""
+    try:
+        from hermes_state import SessionDB
+
+        row = SessionDB().get_session(str(session_id)) or {}
+        return str(row.get("profile_name") or "default")
+    except Exception:
+        logger.debug("[session-relay] could not resolve the profile of %s", session_id, exc_info=True)
+        return "default"
+
+
+def _trigger_web_turn(runner, session_id: str, pct: float) -> bool:
+    """Run one background wake turn on a web session, in-process.
+
+    The API server is a stateless adapter: it has no ``handle_message`` to inject into, so the
+    service turn runs through its own in-process wake (the same path ``gateway.wake`` uses for a
+    served profile). The turn only writes the ``relay-web-auto`` block — the page moves itself to
+    a fresh session, so nothing is reset here.
+    """
+    adapter = _api_server_adapter(runner)
+    if adapter is None:
+        return False
+    wake = getattr(adapter, "run_internal_session_turn", None)
+    if not callable(wake):
+        return False
+    loop = getattr(runner, "_gateway_loop", None)
+    if loop is None or loop.is_closed():
+        return False
+    text = _AUTO_WEB_TRIGGER_TEXT.format(pct=pct)
+    profile = _profile_for_session(session_id)
+
+    async def _run() -> None:
+        await wake(session_id=session_id, text=text, profile=profile,
+                   notification_category="diagnostic")
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_run(), loop)
+    except Exception:
+        logger.warning("[session-relay] could not schedule the web hand-off turn", exc_info=True)
+        return False
+    try:
+        future.result(timeout=180)
+    except Exception:
+        logger.warning("[session-relay] the web hand-off turn failed for %s", session_id, exc_info=True)
+        return False
+    return True
+
+
 def _auto_tick(ctx) -> None:
     """One watchdog pass: trigger a relay when a chat is full and idle, then reset it."""
     if not _auto_setting(ctx, "auto_handoff"):
@@ -560,7 +632,13 @@ def _auto_tick(ctx) -> None:
 
     # Phase 1: relays already triggered — reset once the note exists and the turn is over.
     for sid, stage in list(state.items()):
-        if str(stage.get("stage") or "") != "triggered":
+        stage_name = str(stage.get("stage") or "")
+        if stage_name == "web":
+            # A web session is never reset from here: the page moves itself to a fresh id once it
+            # sees the relay-web-auto block. Keep the mark until the note ages out (24h) — a page
+            # that was closed at the time still finds the block in its transcript when it opens.
+            continue
+        if stage_name != "triggered":
             continue
         route = str(stage.get("route") or "")
         if not route:
@@ -650,6 +728,16 @@ def _auto_tick(ctx) -> None:
                 continue
             pct = 100.0 * tokens / limit
             if pct < threshold:
+                continue
+            if platform == "api_server":
+                # Stateless web channel: no injection seam and no server-side reset. The wake turn
+                # writes the relay-web-auto block; the page carries it to a new session itself.
+                if not _trigger_web_turn(runner, sid, pct):
+                    continue
+                state[sid] = {"stage": "web", "ts": now, "route": route, "platform": platform}
+                changed = True
+                logger.info("[session-relay] auto relay (web): %s is at %.0f%% of %d tokens — "
+                            "hand-off turn started", sid, pct, limit)
                 continue
             if not _inject_trigger(ctx, route, pct):
                 continue

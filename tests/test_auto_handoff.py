@@ -203,6 +203,52 @@ state = json.loads(mod._auto_state_path().read_text(encoding="utf-8"))
 check("a note older than the chat's last words is dropped", "sid8" not in state and not note8.exists())
 check("nothing is reset with a stale note", calls11 == [])
 
+# 18. web channel (api_server): a wake turn is started, nothing is injected and nothing reset
+fresh_state()
+write_log(log, "sid20", "api_server", 800, 600)
+_orig_web = mod._trigger_web_turn
+web_calls = []
+mod._trigger_web_turn = lambda runner, sid, pct: (web_calls.append((sid, round(pct))), True)[1]
+cfg_web = {**BASE, "auto_channels": ["telegram", "api_server"]}
+ctxw, callsw = run(cfg_web, Store([Entry("agent:main:api_server:dm:sid20", "sid20", "api_server")]), log)
+check("web: hand-off turn started once", web_calls == [("sid20", 80)])
+check("web: nothing injected into the chat", ctxw.injected == [])
+check("web: nothing reset on the server", callsw == [])
+state = json.loads(mod._auto_state_path().read_text(encoding="utf-8"))
+check("web: state marks the session as web", state.get("sid20", {}).get("stage") == "web")
+
+# 19. the next tick starts no second wake turn and still never resets
+web_calls.clear()
+ctxw2, callsw2 = run(cfg_web, Store([Entry("agent:main:api_server:dm:sid20", "sid20", "api_server")]), log)
+check("web: no second wake turn", web_calls == [])
+check("web: still never reset", callsw2 == [])
+
+# 20. a web channel that is not configured is left alone
+fresh_state()
+write_log(log, "sid21", "api_server", 800, 600)
+web_calls.clear()
+ctxw3, callsw3 = run(BASE, Store([Entry("agent:main:api_server:dm:sid21", "sid21", "api_server")]), log)
+check("web: not configured means no wake turn", web_calls == [] and ctxw3.injected == [])
+
+# 21. the real wake helper refuses cleanly when there is no api_server adapter
+mod._trigger_web_turn = _orig_web
+
+
+class _NoAdapter:
+    adapters = {}
+
+
+check("web wake refuses without an adapter", mod._trigger_web_turn(_NoAdapter(), "sid20", 80) is False)
+
+# 22. a web mark survives the trigger window: a closed page still finds the block later
+fresh_state()
+write_log(log, "sid22", "api_server", 800, 600)
+mod._save_auto_state({"sid22": {"stage": "web", "ts": time.time() - 3600,
+                                "route": "agent:main:api_server:dm:sid22", "platform": "api_server"}})
+web_calls.clear()
+ctxw4, callsw4 = run(cfg_web, Store([Entry("agent:main:api_server:dm:sid22", "sid22", "api_server")]), log)
+check("web: an old mark blocks a second wake turn", web_calls == [] and callsw4 == [])
+
 failed = [n for n, good in ok if not good]
 print()
 print(f"{len(ok)} checks, {len(failed)} failed")
