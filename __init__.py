@@ -71,6 +71,8 @@ _AUTO_DEFAULTS = {
     "auto_min_idle_seconds": 60.0,
     "auto_poll_seconds": 60.0,
     "auto_channels": ["telegram"],
+    # A web session nobody has written in for this long is a leftover, not a live conversation.
+    "auto_max_idle_hours": 6.0,
 }
 # One note per session, and the reset that follows it, live here so a gateway restart cannot
 # fire the same relay twice.
@@ -611,6 +613,32 @@ def _trigger_web_turn(runner, session_id: str, pct: float) -> bool:
     return True
 
 
+def _last_user_word_ts(session_id: str) -> float:
+    """When the human last wrote in this session, epoch seconds (0 when unknown).
+
+    ``internal_notification`` is NOT a usable filter: real web messages carry it too. The
+    watchdog's own service turn is recognised by its text marker instead.
+    """
+    try:
+        from hermes_state import SessionDB
+
+        rows = SessionDB().get_messages(str(session_id), limit=60, latest=True) or []
+    except Exception:
+        logger.debug("[session-relay] could not read the last words of %s", session_id, exc_info=True)
+        return 0.0
+    for message in reversed(rows):
+        if str(message.get("role") or "") != "user":
+            continue
+        text = str(message.get("content") or "").lstrip()
+        if text.startswith("[service:") or text.startswith("[служебное"):
+            continue
+        try:
+            return float(message.get("timestamp") or 0.0)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
 def _auto_tick(ctx) -> None:
     """One watchdog pass: trigger a relay when a chat is full and idle, then reset it."""
     if not _auto_setting(ctx, "auto_handoff"):
@@ -730,6 +758,10 @@ def _auto_tick(ctx) -> None:
             if pct < threshold:
                 continue
             if platform == "api_server":
+                max_idle = float(_auto_setting(ctx, "auto_max_idle_hours"))
+                last_word = _last_user_word_ts(sid)
+                if last_word > 0 and max_idle > 0 and now - last_word > max_idle * 3600:
+                    continue
                 # Stateless web channel: no injection seam and no server-side reset. The wake turn
                 # writes the relay-web-auto block; the page carries it to a new session itself.
                 if not _trigger_web_turn(runner, sid, pct):

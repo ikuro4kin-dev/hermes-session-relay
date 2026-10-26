@@ -89,10 +89,11 @@ def fresh_state() -> None:
         p.unlink()
 
 
-def run(cfg, store, log_path, schedule=None):
+def run(cfg, store, log_path, schedule=None, last_word=None):
     mod._gateway_runner = lambda: Runner(store)
     mod._agent_log_path = lambda: log_path
     mod._context_limit = lambda model: 1000  # no network, 1k window
+    mod._last_user_word_ts = last_word or (lambda sid: time.time())
     calls = []
 
     def fake_schedule(runner, entry):
@@ -239,6 +240,14 @@ class _NoAdapter:
 
 
 check("web wake refuses without an adapter", mod._trigger_web_turn(_NoAdapter(), "sid20", 80) is False)
+
+# 22b. a web session the human left hours ago is a leftover, not a live chat
+fresh_state()
+write_log(log, "sid23", "api_server", 800, 600)
+web_calls.clear()
+ctxw5, callsw5 = run(cfg_web, Store([Entry("agent:main:api_server:dm:sid23", "sid23", "api_server")]),
+                     log, last_word=lambda sid: time.time() - 8 * 3600)
+check("web: a stale human session is left alone", web_calls == [] and ctxw5.injected == [])
 
 # 22. a web mark survives the trigger window: a closed page still finds the block later
 fresh_state()
