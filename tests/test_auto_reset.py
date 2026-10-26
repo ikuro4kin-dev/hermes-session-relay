@@ -89,6 +89,18 @@ class Broken(Runner):
 
 check("a failing funnel is reported", mod._schedule_reset(Broken(loop), Entry()) is False)
 
+# --- session title numbering must survive the length limit ------------------
+check("short title gets -2", mod._next_title("Bugfix") == "Bugfix-2")
+check("numbered title increments", mod._next_title("Bugfix-6") == "Bugfix-7")
+check("zero padding is kept", mod._next_title("Step-09") == "Step-10")
+_long_old = "Перевод комментариев к релизу hermes-agent"
+_long_new = mod._next_title(_long_old)
+check("a long title keeps its number", _long_new.endswith("-2") and len(_long_new) <= mod._TITLE_LIMIT)
+check(
+    "only the base is trimmed",
+    _long_new == _long_old[: mod._TITLE_LIMIT - 2] + "-2",
+)
+
 loop.call_soon_threadsafe(loop.stop)
 failed = [n for n, good in ok if not good]
 print()

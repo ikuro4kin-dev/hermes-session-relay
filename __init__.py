@@ -125,14 +125,18 @@ def _next_title(title: str) -> str:
         return ""
     m = re.match(r"^(.*?)(\d+)(\D*)$", t, re.S)
     if not m:
-        out = t + "-2"
+        base, suffix = t, "-2"
     else:
         old_num = m.group(2)
         num = str(int(old_num) + 1)
         if len(old_num) > 1 and old_num.startswith("0"):
             num = num.zfill(len(old_num))
-        out = m.group(1) + num + m.group(3)
-    return out[:_TITLE_LIMIT]
+        base, suffix = m.group(1), num + m.group(3)
+    # Trim the BASE, never the suffix: a long title must still show its number.
+    room = _TITLE_LIMIT - len(suffix)
+    if room > 0 and len(base) > room:
+        base = base[:room]
+    return (base + suffix)[:_TITLE_LIMIT]
 
 
 def _data_dir() -> Path:
@@ -552,6 +556,7 @@ def _auto_tick(ctx) -> None:
     running = _running_keys(runner)
     state = _load_auto_state()
     changed = False
+    scan = _scan_log(_agent_log_path())
 
     # Phase 1: relays already triggered — reset once the note exists and the turn is over.
     for sid, stage in list(state.items()):
@@ -564,10 +569,25 @@ def _auto_tick(ctx) -> None:
             continue
         if now - float(stage.get("ts") or 0) > _AUTO_TRIGGER_TIMEOUT_S:
             logger.info("[session-relay] auto relay for %s timed out: no hand-off was written", sid)
+            _remove_pending(sid)
             state.pop(sid, None)
             changed = True
             continue
-        if route in running or not _pending_path(sid).is_file():
+        note_path = _pending_path(sid)
+        if route in running or not note_path.is_file():
+            continue
+        # Anything the chat said after the note was written would not be in it: drop this note and
+        # let the next idle window write a fresh one instead of relaying a stale hand-off.
+        try:
+            note_ts = note_path.stat().st_mtime
+        except OSError:
+            note_ts = 0.0
+        last_ts = float((scan.get(sid) or {}).get("last_ts") or 0.0)
+        if last_ts > note_ts + 2.0:
+            _remove_pending(sid)
+            state.pop(sid, None)
+            changed = True
+            logger.info("[session-relay] auto relay for %s cancelled: the chat spoke after the note", sid)
             continue
         try:
             entry = store.lookup_by_session_key(route)
@@ -600,7 +620,6 @@ def _auto_tick(ctx) -> None:
             changed = True
 
     # Phase 3: new candidates.
-    scan = _scan_log(_agent_log_path())
     if scan:
         try:
             entries = store.list_sessions()
