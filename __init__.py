@@ -79,6 +79,7 @@ _AUTO_DEFAULTS = {
 _AUTO_STATE_FILE = "auto_state.json"
 _AUTO_STATE_MAX_AGE_S = 24 * 3600
 _AUTO_TRIGGER_TIMEOUT_S = 10 * 60  # the agent gets this long to write the note
+_AUTO_CANCEL_COOLDOWN_S = 15 * 60  # after a cancel, leave this chat alone for this long
 _LOG_TAIL_BYTES = 3 * 1024 * 1024
 
 _LOG_HEAD_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ .*?\[(?P<sid>[^\]]+)\]")
@@ -661,6 +662,11 @@ def _auto_tick(ctx) -> None:
     # Phase 1: relays already triggered — reset once the note exists and the turn is over.
     for sid, stage in list(state.items()):
         stage_name = str(stage.get("stage") or "")
+        if stage_name == "cooldown":
+            if now - float(stage.get("ts") or 0) > _AUTO_CANCEL_COOLDOWN_S:
+                state.pop(sid, None)
+                changed = True
+            continue
         if stage_name == "web":
             # A web session is never reset from here: the page moves itself to a fresh id once it
             # sees the relay-web-auto block. Keep the mark until the note ages out (24h) — a page
@@ -682,16 +688,17 @@ def _auto_tick(ctx) -> None:
         note_path = _pending_path(sid)
         if route in running or not note_path.is_file():
             continue
-        # Anything the chat said after the note was written would not be in it: drop this note and
-        # let the next idle window write a fresh one instead of relaying a stale hand-off.
         try:
             note_ts = note_path.stat().st_mtime
         except OSError:
             note_ts = 0.0
-        last_ts = float((scan.get(sid) or {}).get("last_ts") or 0.0)
-        if last_ts > note_ts + 2.0:
+        # Only a message from the human invalidates the note. Any line in the log is not enough:
+        # the watchdog's own service turn and the agent's one-line reply to it land in the same
+        # log a few seconds after the note, and counting them cancelled every automatic relay.
+        user_ts = _last_user_word_ts(sid)
+        if user_ts > note_ts + 2.0:
             _remove_pending(sid)
-            state.pop(sid, None)
+            state[sid] = {"stage": "cooldown", "ts": now, "route": route}
             changed = True
             logger.info("[session-relay] auto relay for %s cancelled: the chat spoke after the note", sid)
             continue

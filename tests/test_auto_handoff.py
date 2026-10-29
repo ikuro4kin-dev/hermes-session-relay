@@ -201,8 +201,35 @@ mod._save_auto_state({"sid8": {"stage": "triggered", "ts": time.time() - 60, "ro
 write_log(log, "sid8", "telegram", 800, 5)  # the chat spoke 5 seconds ago, after the note
 ctx11, calls11 = run(BASE, Store([Entry("route1", "sid8", "telegram")]), log)
 state = json.loads(mod._auto_state_path().read_text(encoding="utf-8"))
-check("a note older than the chat's last words is dropped", "sid8" not in state and not note8.exists())
-check("nothing is reset with a stale note", calls11 == [])
+check("a note older than the chat's last words is dropped", not note8.exists())
+check("nothing is reset with a stale note", calls11 == [] and ctx11.injected == [])
+check("the chat goes on a cooldown instead of re-triggering",
+      state.get("sid8", {}).get("stage") == "cooldown")
+
+# 12b. the agent's own reply after the note must NOT cancel the relay (live bug, 29.10)
+fresh_state()
+note9 = mod._pending_path("sid9")
+note9.parent.mkdir(parents=True, exist_ok=True)
+note9.write_text(json.dumps({"session_id": "sid9", "text": "fresh", "created_at": time.time()}),
+                 encoding="utf-8")
+os.utime(note9, (time.time() - 30, time.time() - 30))
+mod._save_auto_state({"sid9": {"stage": "triggered", "ts": time.time() - 60, "route": "route1"}})
+write_log(log, "sid9", "telegram", 800, 2)  # the service turn and the agent's reply landed after
+ctx12, calls12 = run(BASE, Store([Entry("route1", "sid9", "telegram")]), log,
+                     last_word=lambda sid: time.time() - 600)  # the human wrote before the note
+check("a note survives the agent's own reply", calls12 == ["route1"])
+
+# 12c. a cancelled chat is left alone for the cooldown window, then may relay again
+fresh_state()
+write_log(log, "sid10", "telegram", 800, 600)
+mod._save_auto_state({"sid10": {"stage": "cooldown", "ts": time.time() - 60, "route": "route1"}})
+ctx13, calls13 = run(BASE, Store([Entry("route1", "sid10", "telegram")]), log)
+check("cooldown blocks a new trigger", ctx13.injected == [])
+mod._save_auto_state({"sid10": {"stage": "cooldown",
+                                "ts": time.time() - (mod._AUTO_CANCEL_COOLDOWN_S + 10),
+                                "route": "route1"}})
+ctx14, calls14 = run(BASE, Store([Entry("route1", "sid10", "telegram")]), log)
+check("cooldown expires and the chat can relay again", len(ctx14.injected) == 1)
 
 # 18. web channel (api_server): a wake turn is started, nothing is injected and nothing reset
 fresh_state()
