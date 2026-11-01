@@ -57,6 +57,35 @@ function nextTitle(raw) {
   return out.length > TITLE_LIMIT ? out.slice(0, TITLE_LIMIT) : out
 }
 
+/** First words of a hand-off note, whitespace collapsed: the new chat's list preview starts with them. */
+function noteMarker(note) {
+  return String(note || '').replace(/\s+/g, ' ').trim().slice(0, 40)
+}
+
+/**
+ * Pick the chat the relay just opened: a session that is not the old one and appeared
+ * around the relay. Match on the note's opening first (exact, independent of labels);
+ * otherwise accept any desktop-ish row. Builds differ on the label they store for a
+ * desktop chat — "desktop" on some, "local" (created_source stays "desktop") when the
+ * routing row is stamped first — so a strict `source === 'desktop'` check misses the
+ * new chat and the title is never applied.
+ */
+function findFreshSession(rows, storedId, sinceTs, marker) {
+  const fresh = (rows || []).filter(
+    r => r && r.id && r.id !== storedId && (!r.started_at || r.started_at >= sinceTs - 120)
+  )
+  if (!fresh.length) {
+    return null
+  }
+  if (marker) {
+    const hit = fresh.find(r => String(r.preview || '').replace(/\s+/g, ' ').includes(marker))
+    if (hit) {
+      return hit
+    }
+  }
+  return fresh.find(r => ['desktop', 'local', 'gui'].includes(String(r.source || '').toLowerCase())) || null
+}
+
 export default {
   id: ID,
   name: 'Session Relay',
@@ -156,7 +185,7 @@ export default {
       )
     }
 
-    function watchForSession(storedId, newTitle) {
+    function watchForSession(storedId, newTitle, marker) {
       // ~2 minute window: 24 ticks × 5 s after an initial 4 s pause.
       let left = 24
       const t0 = Date.now() / 1000
@@ -168,9 +197,7 @@ export default {
           // gateway writes the new chat's title only after its first turn
           // ends (minutes), so a title check used to time out and report a
           // false "not confirmed".
-          const hit = rows.find(
-            r => r && r.id !== storedId && r.source === 'desktop' && (!r.started_at || r.started_at >= t0 - 120)
-          )
+          const hit = findFreshSession(rows, storedId, t0, marker)
           if (hit) {
             applyTitle(hit.id, newTitle, true)
             $relay.set({ phase: 'done', title: newTitle })
@@ -238,7 +265,7 @@ export default {
               ? 'Session relay: "' + a.newTitle + '" starts with the hand-off note.'
               : 'Session relay: the hand-off note went to the new chat.'
           })
-          watchForSession(a.storedId, a.newTitle)
+          watchForSession(a.storedId, a.newTitle, noteMarker(note))
           return
         }
         if (attempt < SEED_TRIES) {
